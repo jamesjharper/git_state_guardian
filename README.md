@@ -32,11 +32,6 @@ For each directory matching `workspace*` under the selected OpenClaw base direct
 - auto-discovers new `workspace*` directories and starts watchers for them
 - compacts history when the configured commit limit is exceeded
 
-## What it does not do
-
-This version does **not** create rsync snapshots or `.backup_snapshots` directories.
-It only keeps Git history in `.auto_git_repo`.
-
 ## Requirements
 
 - Linux with `systemd`
