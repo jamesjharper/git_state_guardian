@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-###############################################################################
-# Root check
-###############################################################################
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "This installer must be run with sudo or as root."
   echo "Example:"
@@ -11,19 +8,17 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-###############################################################################
-# Inputs and defaults
-###############################################################################
 RUN_AS_USER="${2:-${SUDO_USER:-$(whoami)}}"
 BASE_DIR="${1:-/home/${RUN_AS_USER}/.openclaw}"
 
 DEBOUNCE_SECONDS="${DEBOUNCE_SECONDS:-20}"
-SNAPSHOT_KEEP="${SNAPSHOT_KEEP:-20}"
 GIT_MAX_COMMITS="${GIT_MAX_COMMITS:-200}"
 
 CONFIG_FILE="/etc/default/workspace-backup.conf"
 LIB_DIR="/usr/local/lib/workspace-backup"
 BIN_DIR="/usr/local/bin"
+
+# Tunables are read from environment at install time and written to CONFIG_FILE.
 
 if [[ -z "$RUN_AS_USER" ]]; then
   echo "Could not determine target user."
@@ -49,22 +44,16 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Installing workspace backup system"
+echo "Installing workspace git backup system"
 echo "Base dir:          $BASE_DIR"
 echo "Run as user:       $RUN_AS_USER"
 echo "Run as group:      $RUN_AS_GROUP"
 echo "Debounce seconds:  $DEBOUNCE_SECONDS"
-echo "Snapshots kept:    $SNAPSHOT_KEEP"
 echo "Git max commits:   $GIT_MAX_COMMITS"
 echo
 
-###############################################################################
-# Install required packages only if missing
-###############################################################################
 MISSING_PKGS=()
-
 command -v inotifywait >/dev/null 2>&1 || MISSING_PKGS+=("inotify-tools")
-command -v rsync >/dev/null 2>&1 || MISSING_PKGS+=("rsync")
 command -v git >/dev/null 2>&1 || MISSING_PKGS+=("git")
 command -v flock >/dev/null 2>&1 || MISSING_PKGS+=("util-linux")
 command -v runuser >/dev/null 2>&1 || MISSING_PKGS+=("util-linux")
@@ -81,25 +70,20 @@ if [[ "${#MISSING_PKGS[@]}" -gt 0 ]]; then
   fi
 fi
 
+# Install directories
 mkdir -p "$LIB_DIR" "$BIN_DIR"
 
-###############################################################################
-# Write config file
-###############################################################################
 cat >"$CONFIG_FILE" <<EOF
 BASE_DIR="$BASE_DIR"
 RUN_AS_USER="$RUN_AS_USER"
 RUN_AS_GROUP="$RUN_AS_GROUP"
 DEBOUNCE_SECONDS="$DEBOUNCE_SECONDS"
-SNAPSHOT_KEEP="$SNAPSHOT_KEEP"
 GIT_MAX_COMMITS="$GIT_MAX_COMMITS"
 EOF
 
 chmod 0644 "$CONFIG_FILE"
 
-###############################################################################
-# Common library
-###############################################################################
+# Shared runtime library
 cat >"$LIB_DIR/common.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -135,8 +119,29 @@ list_workspaces() {
 
 ensure_workspace_dirs() {
   local ws="$1"
-  mkdir -p "$ws/.backup_snapshots"
   mkdir -p "$ws/.auto_git_repo"
+}
+
+write_excludes() {
+  local ws="$1"
+  local git_dir="$ws/.auto_git_repo"
+
+  mkdir -p "$git_dir/info"
+  cat >"$git_dir/info/exclude" <<'EXCL'
+.auto_git_repo/
+.git/
+skills/
+memory/
+EXCL
+}
+
+git_add_workspace_content() {
+  local ws="$1"
+  local git_dir="$ws/.auto_git_repo"
+
+  # Rely on info/exclude. Do not pass ignored paths explicitly, otherwise git add
+  # can return non-zero under set -e even when the staging itself succeeds.
+  git --git-dir="$git_dir" --work-tree="$ws" add -A -- .
 }
 
 ensure_workspace_repo() {
@@ -145,26 +150,24 @@ ensure_workspace_repo() {
 
   ensure_workspace_dirs "$ws"
 
-  if [[ ! -d "$git_dir/objects" ]]; then
-    git init --quiet "$git_dir"
+  if [[ ! -f "$git_dir/HEAD" || ! -d "$git_dir/objects" ]]; then
+    rm -rf "$git_dir"
+    git init --bare --quiet "$git_dir"
   fi
 
-  git --git-dir="$git_dir" config core.worktree "$ws"
+  git --git-dir="$git_dir" rev-parse --git-dir >/dev/null 2>&1
+
   git --git-dir="$git_dir" config user.name "Workspace Auto Backup"
   git --git-dir="$git_dir" config user.email "workspace-backup@localhost"
+  git --git-dir="$git_dir" config advice.addIgnoredFile false
 
-  mkdir -p "$git_dir/info"
-  touch "$git_dir/info/exclude"
-
-  grep -qxF '.auto_git_repo/' "$git_dir/info/exclude" || echo '.auto_git_repo/' >>"$git_dir/info/exclude"
-  grep -qxF '.backup_snapshots/' "$git_dir/info/exclude" || echo '.backup_snapshots/' >>"$git_dir/info/exclude"
+  write_excludes "$ws"
 
   if ! git --git-dir="$git_dir" rev-parse --verify HEAD >/dev/null 2>&1; then
-    (
-      cd "$ws"
-      git --git-dir="$git_dir" add -A
-      git --git-dir="$git_dir" commit --quiet -m "Initial snapshot" || true
-    )
+    git_add_workspace_content "$ws"
+    if ! git --git-dir="$git_dir" --work-tree="$ws" diff --cached --quiet; then
+      git --git-dir="$git_dir" --work-tree="$ws" commit --quiet -m "Initial snapshot"
+    fi
   fi
 }
 
@@ -182,27 +185,25 @@ compact_git_history_if_needed() {
   log "Compacting git history for $ws (commit count: $commit_count)"
 
   local current_branch
-  current_branch="$(git --git-dir="$git_dir" symbolic-ref --short HEAD 2>/dev/null || echo main)"
+  current_branch="$(git --git-dir="$git_dir" symbolic-ref --short HEAD 2>/dev/null || echo master)"
 
   local temp_branch="history-compaction-tmp"
   local ts
   ts="$(date +"%Y-%m-%d_%H-%M-%S")"
 
-  (
-    cd "$ws"
+  git --git-dir="$git_dir" --work-tree="$ws" checkout --orphan "$temp_branch" >/dev/null 2>&1 || true
+  git_add_workspace_content "$ws"
+  if ! git --git-dir="$git_dir" --work-tree="$ws" diff --cached --quiet; then
+    git --git-dir="$git_dir" --work-tree="$ws" commit --quiet -m "History compacted at $ts"
+  fi
 
-    git --git-dir="$git_dir" checkout --orphan "$temp_branch" >/dev/null 2>&1 || true
-    git --git-dir="$git_dir" add -A
-    git --git-dir="$git_dir" commit --quiet -m "History compacted at $ts" || true
+  if git --git-dir="$git_dir" show-ref --verify --quiet "refs/heads/$current_branch"; then
+    git --git-dir="$git_dir" branch -D "$current_branch" >/dev/null 2>&1 || true
+  fi
 
-    if git --git-dir="$git_dir" show-ref --verify --quiet "refs/heads/$current_branch"; then
-      git --git-dir="$git_dir" branch -D "$current_branch" >/dev/null 2>&1 || true
-    fi
-
-    git --git-dir="$git_dir" branch -m "$current_branch" >/dev/null 2>&1 || true
-    git --git-dir="$git_dir" reflog expire --expire=now --all || true
-    git --git-dir="$git_dir" gc --prune=now >/dev/null 2>&1 || true
-  )
+  git --git-dir="$git_dir" branch -m "$current_branch" >/dev/null 2>&1 || true
+  git --git-dir="$git_dir" reflog expire --expire=now --all || true
+  git --git-dir="$git_dir" gc --prune=now >/dev/null 2>&1 || true
 
   log "Git history compacted for $ws"
 }
@@ -210,44 +211,25 @@ compact_git_history_if_needed() {
 backup_workspace() {
   local ws="$1"
   local git_dir="$ws/.auto_git_repo"
-  local backup_dir="$ws/.backup_snapshots"
 
   ensure_workspace_repo "$ws"
 
   local timestamp
   timestamp="$(date +"%Y-%m-%d_%H-%M-%S")"
 
-  local snapshot_path="$backup_dir/$timestamp"
-  mkdir -p "$snapshot_path"
+  git_add_workspace_content "$ws"
 
-  rsync -a --delete \
-    --exclude ".auto_git_repo" \
-    --exclude ".backup_snapshots" \
-    "$ws/" "$snapshot_path/"
-
-  mapfile -t existing_snapshots < <(find "$backup_dir" -mindepth 1 -maxdepth 1 -type d | sort -r)
-  if [[ "${#existing_snapshots[@]}" -gt "$SNAPSHOT_KEEP" ]]; then
-    for old_dir in "${existing_snapshots[@]:$SNAPSHOT_KEEP}"; do
-      rm -rf "$old_dir"
-    done
+  if ! git --git-dir="$git_dir" diff --cached --quiet; then
+    git --git-dir="$git_dir" --work-tree="$ws" commit --quiet -m "Auto snapshot $timestamp"
   fi
-
-  (
-    cd "$ws"
-    git --git-dir="$git_dir" add -A
-
-    if ! git --git-dir="$git_dir" diff --cached --quiet; then
-      git --git-dir="$git_dir" commit --quiet -m "Auto snapshot $timestamp" || true
-    fi
-  )
 
   compact_git_history_if_needed "$ws"
 }
 
 ensure_workspace_owned_by_target_user() {
   local ws="$1"
-  mkdir -p "$ws/.auto_git_repo" "$ws/.backup_snapshots"
-  chown -R "$RUN_AS_USER:$RUN_AS_GROUP" "$ws/.auto_git_repo" "$ws/.backup_snapshots"
+  mkdir -p "$ws/.auto_git_repo"
+  chown -R "$RUN_AS_USER:$RUN_AS_GROUP" "$ws/.auto_git_repo"
 }
 
 start_workspace_service_if_needed() {
@@ -262,9 +244,7 @@ EOF
 
 chmod 0755 "$LIB_DIR/common.sh"
 
-###############################################################################
-# Init one workspace
-###############################################################################
+# Per-workspace helper commands
 cat >"$BIN_DIR/workspace_init_one.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -283,9 +263,6 @@ EOF
 
 chmod 0755 "$BIN_DIR/workspace_init_one.sh"
 
-###############################################################################
-# Backup one workspace
-###############################################################################
 cat >"$BIN_DIR/workspace_backup_one.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -303,9 +280,6 @@ EOF
 
 chmod 0755 "$BIN_DIR/workspace_backup_one.sh"
 
-###############################################################################
-# Debounced watcher
-###############################################################################
 cat >"$BIN_DIR/workspace_watch_debounced_one.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -325,7 +299,7 @@ command -v inotifywait >/dev/null 2>&1 || {
 
 ensure_workspace_repo "$WORKSPACE"
 
-INOTIFY_EXCLUDES='(^|/)(\.auto_git_repo|\.backup_snapshots|\.git|node_modules|__pycache__|\.pytest_cache)(/|$)'
+INOTIFY_EXCLUDES='(^|/)(\.auto_git_repo|\.git|node_modules|__pycache__|\.pytest_cache)(/|$)'
 
 HASH="$(echo -n "$WORKSPACE" | sha256sum | awk '{print $1}')"
 PIPE="/tmp/workspace-watch-${HASH}.pipe"
@@ -380,9 +354,6 @@ EOF
 
 chmod 0755 "$BIN_DIR/workspace_watch_debounced_one.sh"
 
-###############################################################################
-# Discovery daemon
-###############################################################################
 cat >"$BIN_DIR/workspace_discovery_daemon.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -427,12 +398,10 @@ EOF
 
 chmod 0755 "$BIN_DIR/workspace_discovery_daemon.sh"
 
-###############################################################################
-# systemd watcher template
-###############################################################################
+# systemd units
 cat >/etc/systemd/system/workspace-watch@.service <<EOF
 [Unit]
-Description=Debounced workspace backup watcher for %I
+Description=Debounced workspace git backup watcher for %I
 After=network.target
 
 [Service]
@@ -447,12 +416,9 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-###############################################################################
-# systemd discovery service
-###############################################################################
 cat >/etc/systemd/system/workspace-discovery.service <<'EOF'
 [Unit]
-Description=Auto-discover workspace* directories and start backup watchers
+Description=Auto-discover workspace* directories and start git backup watchers
 After=network.target
 
 [Service]
@@ -465,24 +431,15 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-###############################################################################
-# Prepare existing workspaces
-###############################################################################
 find "$BASE_DIR" -mindepth 1 -maxdepth 1 -type d -name 'workspace*' | while read -r ws; do
-  mkdir -p "$ws/.auto_git_repo" "$ws/.backup_snapshots"
-  chown -R "$RUN_AS_USER:$RUN_AS_GROUP" "$ws/.auto_git_repo" "$ws/.backup_snapshots"
+  mkdir -p "$ws/.auto_git_repo"
+  chown -R "$RUN_AS_USER:$RUN_AS_GROUP" "$ws/.auto_git_repo"
 done
 
-###############################################################################
-# Reload systemd and apply changes
-###############################################################################
 systemctl daemon-reload
-
-# Restart discovery so new config applies
 systemctl enable workspace-discovery.service >/dev/null 2>&1 || true
 systemctl restart workspace-discovery.service
 
-# Restart any existing watcher services so changed settings apply
 systemctl list-unit-files 'workspace-watch@*' --no-legend 2>/dev/null | awk '{print $1}' | while read -r unit; do
   [[ -n "$unit" ]] || continue
   systemctl restart "$unit" >/dev/null 2>&1 || true
@@ -503,13 +460,11 @@ echo "Current settings:"
 echo "  BASE_DIR=$BASE_DIR"
 echo "  RUN_AS_USER=$RUN_AS_USER"
 echo "  DEBOUNCE_SECONDS=$DEBOUNCE_SECONDS"
-echo "  SNAPSHOT_KEEP=$SNAPSHOT_KEEP"
 echo "  GIT_MAX_COMMITS=$GIT_MAX_COMMITS"
 echo
 echo "To change settings later, rerun:"
-echo "  sudo SNAPSHOT_KEEP=40 DEBOUNCE_SECONDS=10 GIT_MAX_COMMITS=500 bash $0 $BASE_DIR $RUN_AS_USER"
+echo "  sudo DEBOUNCE_SECONDS=10 GIT_MAX_COMMITS=500 bash $0 $BASE_DIR $RUN_AS_USER"
 echo
 echo "Restore examples:"
 echo "  git --git-dir=/path/to/workspace/.auto_git_repo --work-tree=/path/to/workspace log"
-echo "  git --git-dir=/path/to/workspace/.auto_git_repo --work-tree=/path/to/workspace checkout HEAD~1 -- skills/"
-echo "  cp -a /path/to/workspace/.backup_snapshots/<timestamp>/* /path/to/workspace/"
+echo "  git --git-dir=/path/to/workspace/.auto_git_repo --work-tree=/path/to/workspace checkout HEAD~1 -- AGENTS.md"

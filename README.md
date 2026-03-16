@@ -1,90 +1,110 @@
 # Workspace Backup Installer
 
-This provides a simple auto-backup system for `workspace*` directories inside an OpenClaw base directory.
+A small systemd-based auto-backup system for OpenClaw `workspace*` directories.
 
-It installs a small systemd-based watcher that:
+It watches each matching workspace, creates debounced Git snapshots in a hidden repo stored at `.auto_git_repo`, and automatically starts watching newly created workspaces.
 
-- automatically discovers folders named `workspace*`
-- watches them for file changes
-- creates filesystem snapshots using `rsync`
-- keeps a lightweight Git history in a separate hidden repo
+## Repository layout
 
-This is useful for recovering from bad changes, reviewing what changed over time, and restoring older workspace states.
+```text
+.
+├── install.sh
+├── uninstall.sh
+├── README.md
+└── Skills/
+    └── git_state_guardian/
+        ├── SKILL.md
+        ├── LICENSE
+        ├── references/
+        │   └── usage-patterns.md
+        └── scripts/
+            ├── README.md
+            └── git_state_guardian.sh
+```
 
----
+## What the installer does
 
-## What it does
+For each directory matching `workspace*` under the selected OpenClaw base directory, the installer:
 
-For each directory matching `workspace*` under the chosen base directory, the installer creates:
+- creates and maintains a hidden Git repo at `.auto_git_repo`
+- starts a per-workspace watcher service
+- debounces file events so frequent writes do not create excessive commits
+- auto-discovers new `workspace*` directories and starts watchers for them
+- compacts history when the configured commit limit is exceeded
 
-- `.auto_git_repo` — a hidden Git repo used for automatic commits
-- `.backup_snapshots` — timestamped file snapshots of the workspace contents
+## What it does not do
 
-The watcher listens for file changes and waits for a quiet period before backing up, so it does not create a backup for every single file write.
+This version does **not** create rsync snapshots or `.backup_snapshots` directories.
+It only keeps Git history in `.auto_git_repo`.
 
-It also automatically starts watching newly created `workspace*` folders.
+## Requirements
 
----
+- Linux with `systemd`
+- `git`
+- `inotifywait` from `inotify-tools`
+- `flock` and `runuser` from `util-linux`
+
+On Debian/Ubuntu systems, missing packages are installed automatically.
 
 ## Install
 
 Run as root or with `sudo`.
 
-Default install target:
+Default target:
 
 - user: detected from `SUDO_USER`
 - base dir: `/home/<user>/.openclaw`
-
-Example:
 
 ```bash
 sudo bash install.sh
 ```
 
-Custom base dir and user:
+Custom base directory and user:
 
 ```bash
 sudo bash install.sh /path/to/.openclaw username
 ```
 
-You can also override the backup settings when installing:
+Override settings during install:
 
 ```bash
-sudo SNAPSHOT_KEEP=40 DEBOUNCE_SECONDS=10 GIT_MAX_COMMITS=500 \
+sudo DEBOUNCE_SECONDS=10 GIT_MAX_COMMITS=500 \
   bash install.sh /path/to/.openclaw username
 ```
 
----
+## Configuration
 
-## Settings
-
-These values can be overridden at install time with environment variables:
-
-- `DEBOUNCE_SECONDS`  
-  How long the watcher waits after file changes stop before creating a backup.  
-  Default: `20`
-
-- `SNAPSHOT_KEEP`  
-  How many snapshot folders to keep in `.backup_snapshots`.  
-  Default: `20`
-
-- `GIT_MAX_COMMITS`  
-  Maximum number of auto-commits to keep before compacting history.  
-  Default: `200`
-
-The active config is written to:
+The installer writes active settings to:
 
 ```bash
 /etc/default/workspace-backup.conf
 ```
 
-To change settings later, just rerun the installer with new values.
+Supported settings:
 
----
+- `BASE_DIR`
+- `RUN_AS_USER`
+- `RUN_AS_GROUP`
+- `DEBOUNCE_SECONDS` (default `20`)
+- `GIT_MAX_COMMITS` (default `200`)
+
+To change settings later, rerun `install.sh` with new values.
+
+## Installed components
+
+The installer creates:
+
+- `/usr/local/lib/workspace-backup/common.sh`
+- `/usr/local/bin/workspace_init_one.sh`
+- `/usr/local/bin/workspace_backup_one.sh`
+- `/usr/local/bin/workspace_watch_debounced_one.sh`
+- `/usr/local/bin/workspace_discovery_daemon.sh`
+- `/etc/systemd/system/workspace-watch@.service`
+- `/etc/systemd/system/workspace-discovery.service`
 
 ## Useful commands
 
-Check the discovery service:
+Check discovery service:
 
 ```bash
 systemctl status workspace-discovery.service
@@ -102,58 +122,50 @@ List watcher services:
 systemctl list-units 'workspace-watch@*'
 ```
 
----
+## Inspecting and restoring workspace state
 
-## Restoring data
-
-### View Git history
-
-```bash
-git --git-dir=/path/to/workspace/.auto_git_repo --work-tree=/path/to/workspace log
-```
-
-### Restore a file or folder from an older Git commit
-
-Example restoring `skills/` from the previous commit:
+View history:
 
 ```bash
 git --git-dir=/path/to/workspace/.auto_git_repo \
     --work-tree=/path/to/workspace \
-    checkout HEAD~1 -- skills/
+    log --oneline --decorate
 ```
 
-### Restore from a snapshot folder
+Restore a file or directory from an older commit:
 
 ```bash
-cp -a /path/to/workspace/.backup_snapshots/<timestamp>/* /path/to/workspace/
+git --git-dir=/path/to/workspace/.auto_git_repo \
+    --work-tree=/path/to/workspace \
+    checkout HEAD~1 -- AGENTS.md
 ```
 
----
+Or use the included skill helper:
+
+```bash
+Skills/git_state_guardian/scripts/git_state_guardian.sh inspect /path/to/workspace
+Skills/git_state_guardian/scripts/git_state_guardian.sh history /path/to/workspace 20
+Skills/git_state_guardian/scripts/git_state_guardian.sh restore /path/to/workspace HEAD~1 -- skills/
+```
 
 ## Uninstall
 
-Remove the services and installed scripts:
+Remove services and installed scripts:
 
 ```bash
 sudo bash uninstall.sh
 ```
 
-By default, uninstall keeps the per-workspace backup data:
+By default, uninstall keeps `.auto_git_repo` inside each workspace.
 
-- `.auto_git_repo`
-- `.backup_snapshots`
-
-To remove those as well:
+To remove those repos too:
 
 ```bash
 sudo REMOVE_WORKSPACE_DATA=1 bash uninstall.sh /path/to/.openclaw username
 ```
 
----
-
 ## Notes
 
-- This expects a **systemd-based Linux system**
-- It installs missing dependencies automatically on `apt`-based systems
-- Only directories named `workspace*` are managed
-- Backup metadata is stored inside each workspace and excluded from the backup process itself
+- Only directories named `workspace*` are managed.
+- Backup metadata is stored inside each workspace and excluded from auto-commit staging.
+- The installer is designed to be rerun safely to update configuration values.
